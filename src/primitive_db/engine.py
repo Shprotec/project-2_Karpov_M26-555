@@ -6,182 +6,226 @@ import prompt
 from prettytable import PrettyTable
 
 from primitive_db import core
-from primitive_db.constants import ID_COLUMN, META_FILE
+from primitive_db.constants import (
+    CMD_CREATE_TABLE,
+    CMD_DELETE,
+    CMD_DROP_TABLE,
+    CMD_EXIT,
+    CMD_HELP,
+    CMD_INFO,
+    CMD_INSERT,
+    CMD_LIST_TABLES,
+    CMD_SELECT,
+    CMD_UPDATE,
+    ID_COLUMN,
+    META_FILE,
+    PROMPT_MESSAGE,
+)
 from primitive_db.decorators import create_cacher, handle_db_errors
 from primitive_db.parser import parse_delete, parse_insert, parse_select, parse_update
 from primitive_db.utils import (
     load_metadata,
     load_table_data,
     remove_table_data,
-    save_dropped_table,
     save_metadata,
     save_table_data,
-    table_data_version,
 )
 
-HELP_TEXT = (
-    "create_table <таблица> <столбец:тип> ... — создать таблицу\n"
-    "list_tables — показать список таблиц\n"
-    "drop_table <таблица> — удалить таблицу\n"
-    "insert into <таблица> values (<значение>, ...) — добавить запись\n"
-    "select from <таблица> [where <столбец> = <значение>] — показать записи\n"
-    "update <таблица> set <столбец> = <значение> where <условие> — обновить записи\n"
-    "delete from <таблица> where <условие> — удалить записи\n"
-    "help — показать справку\n"
-    "exit — выйти"
-)
+HELP_TEXT = """
+***Процесс работы с таблицей***
+Функции:
+<command> create_table <имя_таблицы> <столбец1:тип> <столбец2:тип> .. - создать таблицу
+<command> list_tables - показать список всех таблиц
+<command> drop_table <имя_таблицы> - удалить таблицу
+
+***Операции с данными***
+Функции:
+<command> insert into <имя_таблицы> values (<значение1>, <значение2>, ...) - создать запись.
+<command> select from <имя_таблицы> where <столбец> = <значение> - прочитать записи по условию.
+<command> select from <имя_таблицы> - прочитать все записи.
+<command> update <имя_таблицы> set <столбец1> = <новое_значение1> where <столбец_условия> = <значение_условия> - обновить запись.
+<command> delete from <имя_таблицы> where <столбец> = <значение> - удалить запись.
+<command> info <имя_таблицы> - вывести информацию о таблице.
+
+Общие команды:
+<command> exit - выход из программы
+<command> help - справочная информация
+"""  # noqa: E501
+
+select_cache = create_cacher()
 
 
-def _create_table(args):
-    if len(args) < 2:
-        raise ValueError("Пример: create_table users name:str age:int")
+def print_help():
+    """Выводит справку."""
+    print(HELP_TEXT)
 
-    table_name, *columns = args
-    metadata = load_metadata(META_FILE)
+
+def format_columns(columns):
+    """Собирает строку со столбцами вида ID:int, name:str."""
+    return ", ".join(f"{name}:{column_type}" for name, column_type in columns.items())
+
+
+def require_arguments(args, count):
+    """Проверяет количество слов в команде."""
+    if len(args) != count:
+        raise ValueError(" ".join(args))
+
+
+def create_table_command(metadata, args):
+    """Команда create_table."""
+    if len(args) < 3:
+        raise ValueError(
+            f"{' '.join(args)} (пример: create_table users name:str age:int)"
+        )
+    table_name, columns = args[1], args[2:]
     if core.create_table(metadata, table_name, columns) is None:
-        return False
-    remove_table_data(table_name)
+        return
     save_metadata(META_FILE, metadata)
-    print(f'Таблица "{table_name}" создана.')
-    return True
+    schema = format_columns(core.get_table_columns(metadata, table_name))
+    print(f'Таблица "{table_name}" успешно создана со столбцами: {schema}')
 
 
-def _drop_table(args):
-    if len(args) != 1:
-        raise ValueError("Пример: drop_table users")
-
-    table_name = args[0]
-    metadata = load_metadata(META_FILE)
-    if core.drop_table(metadata, table_name) is None:
-        return False
-
-    if core.has_table_name(metadata, table_name):
-        save_metadata(META_FILE, metadata)
-    else:
-        save_dropped_table(META_FILE, metadata, table_name)
-    print(f'Таблица "{table_name}" удалена.')
-    return True
-
-
-def _list_tables():
-    metadata = load_metadata(META_FILE)
-    if metadata:
-        for table_name in metadata:
-            print(table_name)
-    else:
+def list_tables_command(metadata, args):
+    """Команда list_tables."""
+    require_arguments(args, 1)
+    if not metadata:
         print("Таблиц пока нет.")
+    for table_name in metadata:
+        print(f"- {table_name}")
 
 
-def _insert(user_input):
+def drop_table_command(metadata, args):
+    """Команда drop_table. Наличие таблицы проверяется до подтверждения."""
+    require_arguments(args, 2)
+    table_name = args[1]
+    core.check_table_exists(metadata, table_name)
+    if core.drop_table(metadata, table_name) is None:
+        return
+    save_metadata(META_FILE, metadata)
+    remove_table_data(table_name)
+    select_cache.clear()
+    print(f'Таблица "{table_name}" успешно удалена.')
+
+
+def insert_command(metadata, user_input):
+    """Команда insert."""
     table_name, values = parse_insert(user_input)
-    metadata = load_metadata(META_FILE)
-    rows = core.insert(metadata, table_name, values)
-    if rows is None:
-        return False
-
-    save_table_data(table_name, rows)
-    print(f"Запись с ID={rows[-1][ID_COLUMN]} добавлена.")
-    return True
-
-
-def _select(user_input, cache_result):
-    table_name, conditions = parse_select(user_input)
-    columns = core.get_table_columns(load_metadata(META_FILE), table_name)
-    core.validate_values(columns, conditions or {})
-    cache_key = (
-        table_name,
-        tuple(sorted((conditions or {}).items())),
-        table_data_version(table_name),
-    )
-    rows = cache_result(
-        cache_key, lambda: core.select(load_table_data(table_name), conditions)
-    )
+    rows = core.insert(metadata, table_name, values, load_table_data(table_name))
     if rows is None:
         return
+    save_table_data(table_name, rows)
+    select_cache.clear()
+    new_id = rows[-1][ID_COLUMN]
+    print(f'Запись с ID={new_id} успешно добавлена в таблицу "{table_name}".')
+
+
+def select_command(metadata, user_input):
+    """Команда select, результат берётся из кэша."""
+    table_name, conditions = parse_select(user_input)
+    columns = core.get_table_columns(metadata, table_name)
+    core.validate_values(columns, conditions or {})
+    cache_key = (table_name, tuple(sorted((conditions or {}).items())))
+    rows = select_cache(
+        cache_key, lambda: core.select(load_table_data(table_name), conditions)
+    )
     table = PrettyTable(list(columns))
     table.add_rows([[row.get(column) for column in columns] for row in rows])
     print(table)
 
 
-def _update(user_input):
+def update_command(metadata, user_input):
+    """Команда update."""
     table_name, changes, conditions = parse_update(user_input)
-    columns = core.get_table_columns(load_metadata(META_FILE), table_name)
+    columns = core.get_table_columns(metadata, table_name)
     core.validate_values(columns, changes)
     core.validate_values(columns, conditions)
     rows = load_table_data(table_name)
+    row_ids = core.find_row_ids(rows, conditions)
+    if not row_ids:
+        print("Записи, удовлетворяющие условию, не найдены.")
+        return
+
     updated_rows = core.update(rows, changes, conditions)
     if updated_rows is None:
-        return False
-
-    changed = sum(old != new for old, new in zip(rows, updated_rows))
-    if changed:
-        save_table_data(table_name, updated_rows)
-    print(f"Обновлено записей: {changed}.")
-    return bool(changed)
+        return
+    save_table_data(table_name, updated_rows)
+    select_cache.clear()
+    for row_id in row_ids:
+        print(f'Запись с ID={row_id} в таблице "{table_name}" успешно обновлена.')
 
 
-def _delete(user_input):
+def delete_command(metadata, user_input):
+    """Команда delete."""
     table_name, conditions = parse_delete(user_input)
-    columns = core.get_table_columns(load_metadata(META_FILE), table_name)
+    columns = core.get_table_columns(metadata, table_name)
     core.validate_values(columns, conditions)
     rows = load_table_data(table_name)
+    row_ids = core.find_row_ids(rows, conditions)
+    if not row_ids:
+        print("Записи, удовлетворяющие условию, не найдены.")
+        return
+
     remaining_rows = core.delete(rows, conditions)
     if remaining_rows is None:
-        return False
+        return
+    save_table_data(table_name, remaining_rows)
+    select_cache.clear()
+    for row_id in row_ids:
+        print(f'Запись с ID={row_id} успешно удалена из таблицы "{table_name}".')
 
-    removed = len(rows) - len(remaining_rows)
-    if removed:
-        save_table_data(table_name, remaining_rows)
-    print(f"Удалено записей: {removed}.")
-    return bool(removed)
+
+def info_command(metadata, args):
+    """Команда info."""
+    require_arguments(args, 2)
+    table_name = args[1]
+    columns = core.get_table_columns(metadata, table_name)
+    print(f"Таблица: {table_name}")
+    print(f"Столбцы: {format_columns(columns)}")
+    print(f"Количество записей: {len(load_table_data(table_name))}")
 
 
 @handle_db_errors
-def _run_command(user_input, cache_result):
-    words = user_input.split(maxsplit=1)
+def run_command(user_input):
+    """Разбирает введённую строку и выполняет команду."""
+    words = user_input.split()
     if not words:
-        return None
-
+        return
     command = words[0].lower()
-    match command:
-        case "exit":
-            return "exit"
-        case "help":
-            print(HELP_TEXT)
-        case "create_table":
-            if _create_table(shlex.split(user_input)[1:]):
-                return "changed"
-        case "list_tables":
-            _list_tables()
-        case "drop_table":
-            if _drop_table(shlex.split(user_input)[1:]):
-                return "changed"
-        case "insert":
-            if _insert(user_input):
-                return "changed"
-        case "select":
-            _select(user_input, cache_result)
-        case "update":
-            if _update(user_input):
-                return "changed"
-        case "delete":
-            if _delete(user_input):
-                return "changed"
-        case _:
-            print(f"Неизвестная команда: {command}")
-    return None
+    metadata = load_metadata(META_FILE)
+
+    if command == CMD_HELP:
+        print_help()
+    elif command == CMD_CREATE_TABLE:
+        create_table_command(metadata, shlex.split(user_input))
+    elif command == CMD_LIST_TABLES:
+        list_tables_command(metadata, shlex.split(user_input))
+    elif command == CMD_DROP_TABLE:
+        drop_table_command(metadata, shlex.split(user_input))
+    elif command == CMD_INFO:
+        info_command(metadata, shlex.split(user_input))
+    elif command == CMD_INSERT:
+        insert_command(metadata, user_input)
+    elif command == CMD_SELECT:
+        select_command(metadata, user_input)
+    elif command == CMD_UPDATE:
+        update_command(metadata, user_input)
+    elif command == CMD_DELETE:
+        delete_command(metadata, user_input)
+    else:
+        print(f"Функции {words[0]} нет. Попробуйте снова.")
 
 
-def run() -> None:
+def run():
     """Читает команды до выхода из программы."""
-    cache_result = create_cacher()
-    print(HELP_TEXT)
-    try:
-        while True:
-            result = _run_command(prompt.string("Введите команду: "), cache_result)
-            if result == "exit":
-                return
-            if result == "changed":
-                cache_result = create_cacher()
-    except (EOFError, KeyboardInterrupt):
+    print("\n***База данных***")
+    print_help()
+    while True:
+        try:
+            user_input = prompt.string(PROMPT_MESSAGE)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if user_input.strip().lower() == CMD_EXIT:
+            return
+        run_command(user_input)
         print()
